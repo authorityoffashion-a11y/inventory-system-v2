@@ -294,10 +294,19 @@ const InventoryApp = () => {
         }
       }
 
+      // Use actual days with orders as divisor, not always 30
+      // This means if your store only has 8 days of history, we divide by 8 not 30
+      let earliestDate = new Date();
+      for (const o of orders30) { const d = new Date(o.created_at); if (d < earliestDate) earliestDate = d; }
+      const actualDays = orders30.length > 0
+        ? Math.max(1, Math.ceil((new Date() - earliestDate) / (1000 * 60 * 60 * 24)))
+        : 30;
+      log.push();
+
       // Update avg_daily_sales for all products that have 30-day data
       let avgUpdated = 0;
       for (const [sku, totalSold] of Object.entries(skuSales30)) {
-        const avgPerDay = parseFloat((totalSold / 30).toFixed(2));
+        const avgPerDay = parseFloat((totalSold / actualDays).toFixed(2));
         const { data: prod } = await supabase.from('inventory_v2').select('id,reorder_point_custom').eq('sku', sku).maybeSingle();
         if (prod) {
           const updatePayload = { avg_daily_sales: avgPerDay };
@@ -310,7 +319,7 @@ const InventoryApp = () => {
         }
       }
 
-      log.push(`📊 Updated avg_daily_sales for ${avgUpdated} products from last 30 days of orders`);
+      log.push(`📊 Updated avg_daily_sales for ${avgUpdated} products over  actual days`);
 
       const now = new Date().toISOString();
       localStorage.setItem('lastSync', now);
