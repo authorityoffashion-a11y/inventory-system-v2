@@ -248,92 +248,91 @@ const InventoryApp = () => {
     setIsSyncing(true);
     const log = [];
     try {
-      // Always fetch last 30 days for avg_daily_sales calculation
-      const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
-      const since = lastSyncTime ? lastSyncTime.toISOString() : thirtyDaysAgo;
+      // STEP 1: Pull LIVE stock quantities directly from Shopify
+      // This is the source of truth - never subtract orders (causes double-deduction bugs)
+      log.push('Step 1: Fetching live stock from Shopify...');
+      const prodResp = await fetch('/api/shopify?action=getAllProducts');
+      if (!prodResp.ok) throw new Error(await prodResp.text());
+      const prodData = await prodResp.json();
+      const shopifyProducts = prodData.products || [];
+      log.push('Found ' + shopifyProducts.length + ' Shopify products');
 
-      // Fetch new orders since last sync (for deducting stock)
-      const r = await fetch(`/api/shopify?action=getOrders&since=${encodeURIComponent(since)}`);
-      if (!r.ok) throw new Error(await r.text());
-      const d = await r.json();
-      const orders = d.orders || [];
-      log.push(`Found ${orders.length} orders since last sync`);
-
-      // Also fetch 30-day orders for avg calculation (separate call)
-      const r30 = await fetch(`/api/shopify?action=getOrders&since=${encodeURIComponent(thirtyDaysAgo)}`);
-      const d30 = r30.ok ? await r30.json() : { orders: orders };
-      const orders30 = d30.orders || orders;
-
-      // Build a map: sku → total units sold in last 30 days
-      const skuSales30 = {};
-      for (const order of orders30) {
-        for (const item of order.line_items) {
-          if (item.sku) {
-            skuSales30[item.sku] = (skuSales30[item.sku] || 0) + item.quantity;
-          }
-        }
-      }
-
-      // Deduct stock from new orders
-      let processed = 0, notFound = 0;
-      for (const order of orders) {
-        for (const item of order.line_items) {
-          const { data: prod } = await supabase.from('inventory_v2').select('*').eq('sku', item.sku).maybeSingle();
-          if (prod) {
-            const newStock = Math.max(0, prod.sellable_stock - item.quantity);
-            await supabase.from('inventory_v2').update({
-              sellable_stock: newStock,
-              last_sold_at: new Date().toISOString()
-            }).eq('id', prod.id);
-            log.push(`✅ ${prod.product_name}: -${item.quantity} → ${newStock}`);
-            processed++;
-          } else {
-            log.push(`❌ Not found: ${item.name} (SKU: ${item.sku || 'none'})`);
-            notFound++;
-          }
-        }
-      }
-
-      // Use actual days with orders as divisor, not always 30
-      // This means if your store only has 8 days of history, we divide by 8 not 30
-      let earliestDate = new Date();
-      for (const o of orders30) { const d = new Date(o.created_at); if (d < earliestDate) earliestDate = d; }
-      const actualDays = orders30.length > 0
-        ? Math.max(1, Math.ceil((new Date() - earliestDate) / (1000 * 60 * 60 * 24)))
-        : 30;
-      log.push();
-
-      // Update avg_daily_sales for all products that have 30-day data
-      let avgUpdated = 0;
-      for (const [sku, totalSold] of Object.entries(skuSales30)) {
-        const avgPerDay = parseFloat((totalSold / actualDays).toFixed(2));
-        const { data: prod } = await supabase.from('inventory_v2').select('id,reorder_point_custom').eq('sku', sku).maybeSingle();
+      let stockUpdated = 0;
+      for (const sp of shopifyProducts) {
+        const variant = sp.variants[0];
+        const sku = variant.sku || ('SHOPIFY-' + sp.id);
+        const liveQty = variant.inventory_quantity || 0;
+        const { data: prod } = await supabase.from('inventory_v2')
+          .select('id').eq('sku', sku).maybeSingle();
         if (prod) {
-          const updatePayload = { avg_daily_sales: avgPerDay };
-          // Only auto-update reorder_point if user hasn't set a custom one
-          if (!prod.reorder_point_custom) {
-            updatePayload.reorder_point = calcAutoReorderPoint(avgPerDay);
-          }
-          await supabase.from('inventory_v2').update(updatePayload).eq('id', prod.id);
+          await supabase.from('inventory_v2')
+            .update({ sellable_stock: liveQty })
+            .eq('id', prod.id);
+          stockUpdated++;
+        }
+      }
+      log.push('Stock synced for ' + stockUpdated + ' products');
+
+      // STEP 2: Fetch last 7 days of orders just for avg_daily_sales
+      log.push('Step 2: Fetching last 7 days of orders for sales averages...');
+      const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+      const ordResp = await fetch('/api/shopify?action=getOrders&since=' + encodeURIComponent(sevenDaysAgo));
+      const ordData = ordResp.ok ? await ordResp.json() : { orders: [] };
+      const orders7 = ordData.orders || [];
+      log.push('Found ' + orders7.length + ' orders in last 7 days');
+
+      // Find earliest order to get actual day span
+      let earliestDate = new Date();
+      for (const o of orders7) {
+        const d = new Date(o.created_at);
+        if (d < earliestDate) earliestDate = d;
+      }
+      const actualDays = orders7.length > 0
+        ? Math.max(1, Math.ceil((new Date() - earliestDate) / (1000 * 60 * 60 * 24)))
+        : 7;
+      log.push('Calculating avg over ' + actualDays + ' actual days');
+
+      // Tally units sold per SKU
+      const skuSales = {};
+      for (const order of orders7) {
+        for (const item of order.line_items) {
+          if (item.sku) skuSales[item.sku] = (skuSales[item.sku] || 0) + item.quantity;
+        }
+      }
+
+      // Write avg_daily_sales back to DB
+      let avgUpdated = 0;
+      for (const [sku, totalSold] of Object.entries(skuSales)) {
+        const avgPerDay = parseFloat((totalSold / actualDays).toFixed(2));
+        const { data: prod } = await supabase.from('inventory_v2')
+          .select('id,reorder_point_custom').eq('sku', sku).maybeSingle();
+        if (prod) {
+          const payload = { avg_daily_sales: avgPerDay, last_sold_at: new Date().toISOString() };
+          if (!prod.reorder_point_custom) payload.reorder_point = calcAutoReorderPoint(avgPerDay);
+          await supabase.from('inventory_v2').update(payload).eq('id', prod.id);
           avgUpdated++;
         }
       }
-
-      log.push(`📊 Updated avg_daily_sales for ${avgUpdated} products over  actual days`);
+      log.push('Avg daily sales updated for ' + avgUpdated + ' products');
 
       const now = new Date().toISOString();
       localStorage.setItem('lastSync', now);
       setLastSyncTime(new Date(now));
       setImportLog(log);
-      alert(`✅ Order sync done!\nStock deducted: ${processed} items\nNot found: ${notFound}\nAvg sales updated: ${avgUpdated} products`);
+      alert(
+        'Sync complete!\n' +
+        'Stock updated from Shopify: ' + stockUpdated + ' products\n' +
+        'Avg daily sales updated: ' + avgUpdated + ' products (over ' + actualDays + ' days)'
+      );
       fetchProducts();
     } catch (e) {
       console.error(e);
-      alert(`Sync error: ${e.message}`);
+      alert('Sync error: ' + e.message);
     } finally {
       setIsSyncing(false);
     }
   };
+
 
   // FIXED: uses setIsPushing only, completely separate from sync
   const pushSelectedToShopify = async () => {
